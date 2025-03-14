@@ -1,0 +1,11 @@
+Flask
+gunicorn
+pandas
+tensorflow
+scikit-learn
+xgboost
+requests
+beautifulsoup4
+joblib
+yfinance
+textblob
