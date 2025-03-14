@@ -1,105 +1,158 @@
-from flask import Flask, request, jsonify
-import joblib
-import yfinance as yf
 import numpy as np
 import pandas as pd
-from tensorflow.keras.models import load_model
-from textblob import TextBlob
+import yfinance as yf
+import joblib
+import os
 import requests
 from bs4 import BeautifulSoup
+from textblob import TextBlob
+from tensorflow.keras.models import load_model
+import xgboost as xgb
+from sklearn.preprocessing import MinMaxScaler
+
+# ✅ Fetch Sentiment Score
+def sentiment(symbol):
+    url = f"https://www.bing.com/news/search?q={symbol}+stock"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        soup = BeautifulSoup(requests.get(url, headers=headers).text, "html.parser")
+        headlines = [h.text for h in soup.find_all("a") if h.text.strip()]
+        return np.mean([TextBlob(h).sentiment.polarity for h in headlines]) if headlines else 0
+    except:
+        return 0  # If request fails, return neutral sentiment
+
+# ✅ Compute Technical Indicators
+def indicators(df):
+    df['SMA_50'] = df['Close'].rolling(50).mean()
+    df['SMA_200'] = df['Close'].rolling(200).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200).mean()
+    df['RSI'] = 100 - (100 / (1 + df['Close'].diff().clip(lower=0).rolling(14).mean() /
+                            -df['Close'].diff().clip(upper=0).rolling(14).mean()))
+    df['MACD'] = df['Close'].ewm(span=12).mean() - df['Close'].ewm(span=26).mean()
+    df['Signal'] = df['MACD'].ewm(span=9).mean()
+    df.fillna(method="bfill", inplace=True)
+    return df
+
+# ✅ Load or Train XGBoost if missing
+def train_xgboost(symbol, df, features):
+    print(f"⚠️ XGBoost not found for {symbol}. Training now...")
+    
+    X, y = df[features], df['Close']
+    scaler_X, scaler_y = MinMaxScaler(), MinMaxScaler()
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y.values.reshape(-1, 1))
+    
+    xgb_model = xgb.XGBRegressor(n_estimators=100, max_depth=6)
+    xgb_model.fit(X_scaled, y_scaled)
+    
+    joblib.dump(xgb_model, f"models/{symbol}_xgb.pkl")
+    joblib.dump(scaler_X, f"models/{symbol}_scaler_X.pkl")
+    joblib.dump(scaler_y, f"models/{symbol}_scaler_y.pkl")
+    
+    print(f"✅ XGBoost trained & saved for {symbol}.")
+    return xgb_model, scaler_X, scaler_y
+
+# ✅ Main Prediction Function
+def predict(symbol):
+    print(f"📈 Fetching data for {symbol}...")
+    df = yf.download(symbol, period="180d")[['Close', 'Volume']]
+    
+    if df.empty:
+        print(f"❌ No data found for {symbol}. Check the ticker.")
+        return
+
+    df = indicators(df)
+    df['Sentiment'] = sentiment(symbol)
+
+    features = ['Close', 'Volume', 'SMA_50', 'SMA_200', 'EMA_50', 'EMA_200', 'RSI', 'MACD', 'Signal', 'Sentiment']
+    model_path = f"models/{symbol}_lstm.h5"
+    xgb_path = f"models/{symbol}_xgb.pkl"
+
+    # 🚀 Check if enough data is available
+    if len(df) < 60:
+        print("⚠️ Not enough historical data. Using XGBoost.")
+        if not os.path.exists(xgb_path):
+            xgb_model, scaler_X, scaler_y = train_xgboost(symbol, df, features)
+        else:
+            xgb_model = joblib.load(xgb_path)
+            scaler_X = joblib.load(f"models/{symbol}_scaler_X.pkl")
+            scaler_y = joblib.load(f"models/{symbol}_scaler_y.pkl")
+
+        valid_features = [f for f in features if f in df.columns]
+        scaled_features = scaler_X.transform(df[valid_features][-1:].values)
+
+        pred_scaled = xgb_model.predict(scaled_features)
+        pred = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1))[0][0]
+        print(f"🔮 **Predicted Closing Price for {symbol}:** ₹{pred:.2f} (XGBoost Model)")
+        return
+
+    # 🚀 Fallback Mechanism: Use LSTM if available, else try XGBoost
+    if os.path.exists(model_path):
+        try:
+            model = load_model(model_path)
+            scaler_X = joblib.load(f"models/{symbol}_scaler_X.pkl")
+            scaler_y = joblib.load(f"models/{symbol}_scaler_y.pkl")
+
+            valid_features = [f for f in features if f in df.columns]
+            scaled_features = scaler_X.transform(df[valid_features][-60:].values)
+            sequence = scaled_features.reshape(1, 60, len(valid_features))
+
+            pred_scaled = model.predict(sequence)
+            pred = scaler_y.inverse_transform(pred_scaled)[0][0]
+            print(f"🔮 **Predicted Closing Price for {symbol}:** ₹{pred:.2f} (LSTM Model)")
+            return
+        except Exception as e:
+            print(f"⚠️ LSTM error: {e}. Falling back to XGBoost...")
+
+    # 🚀 Use XGBoost if LSTM fails
+    if os.path.exists(xgb_path):
+        try:
+            xgb_model = joblib.load(xgb_path)
+            scaler_X = joblib.load(f"models/{symbol}_scaler_X.pkl")
+            scaler_y = joblib.load(f"models/{symbol}_scaler_y.pkl")
+
+            valid_features = [f for f in features if f in df.columns]
+            scaled_features = scaler_X.transform(df[valid_features][-1:].values)
+
+            pred_scaled = xgb_model.predict(scaled_features)
+            pred = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1))[0][0]
+            print(f"🔮 **Predicted Closing Price for {symbol}:** ₹{pred:.2f} (XGBoost Model)")
+            return
+        except Exception as e:
+            print(f"⚠️ XGBoost error: {e}. Training XGBoost...")
+
+    # 🚀 If XGBoost is also missing, train it on the spot
+    xgb_model, scaler_X, scaler_y = train_xgboost(symbol, df, features)
+    valid_features = [f for f in features if f in df.columns]
+    scaled_features = scaler_X.transform(df[valid_features][-1:].values)
+
+    pred_scaled = xgb_model.predict(scaled_features)
+    pred = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1))[0][0]
+    print(f"🔮 **Predicted Closing Price for {symbol}:** ₹{pred:.2f} (Newly Trained XGBoost)")
+
+# ✅ Run Prediction
+if __name__ == "__main__":
+    symbol = input("Enter Stock Symbol: ").strip().upper()
+    predict(symbol)
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ✅ Load Models & Scalers (Pretrained LSTM & XGBoost)
-try:
-    lstm_model = load_model("ITC.NS_model.h5")  # Update if using a different model
-    scaler_X = joblib.load("ITC.NS_scaler_X.pkl")
-    scaler_y = joblib.load("ITC.NS_scaler_y.pkl")
-    xgb_model = joblib.load("ITC.NS_xgb.pkl")
-except Exception as e:
-    print(f"⚠️ Model Loading Error: {e}")
-    lstm_model, scaler_X, scaler_y, xgb_model = None, None, None, None
+@app.route('/')
+def home():
+    return "Stock Prediction API is Running!"
 
-# ✅ Fetch stock data
-def get_stock_data(symbol):
-    try:
-        df = yf.download(symbol, period="60d", interval="1d")
-        df = df[['Close', 'Volume']].dropna()
-        return df
-    except Exception as e:
-        print(f"Error fetching stock data: {e}")
-        return None
-
-# ✅ Compute technical indicators
-def compute_indicators(df):
-    df["SMA_50"] = df["Close"].rolling(50).mean()
-    df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    df["RSI"] = 100 - (100 / (1 + gain / loss))
-    df["MACD"] = df["Close"].ewm(span=12).mean() - df["Close"].ewm(span=26).mean()
-    df["Signal"] = df["MACD"].ewm(span=9).mean()
-    return df.fillna(method="bfill").fillna(method="ffill")
-
-# ✅ Fetch news sentiment
-def get_sentiment(symbol):
-    url = f"https://www.bing.com/news/search?q={symbol}+stock"
-    try:
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        soup = BeautifulSoup(response.text, "html.parser")
-        headlines = [h.text for h in soup.find_all("a") if h.text.strip()]
-        sentiment_scores = [TextBlob(headline).sentiment.polarity for headline in headlines]
-        return np.mean(sentiment_scores) if sentiment_scores else 0
-    except:
-        return 0
-
-# ✅ Predict stock price
-@app.route("/predict", methods=["GET"])
+@app.route('/predict', methods=['GET'])
 def predict():
-    symbol = request.args.get("symbol", "").upper().strip()
-    if not symbol:
-        return jsonify({"error": "Stock symbol is required"}), 400
-
-    df = get_stock_data(symbol)
-    if df is None or df.empty:
-        return jsonify({"error": "Stock data not available"}), 404
-
-    df = compute_indicators(df)
-    df["Sentiment"] = get_sentiment(symbol)
-
-    features = ["Close", "Volume", "SMA_50", "EMA_50", "RSI", "MACD", "Signal", "Sentiment"]
-    
-    try:
-        scaled_features = scaler_X.transform(df[features].values[-60:])
-        sequence = scaled_features.reshape(1, 60, len(features))
-        lstm_pred_scaled = lstm_model.predict(sequence)
-        lstm_pred = scaler_y.inverse_transform(lstm_pred_scaled.reshape(-1, 1))[0, 0]
-    except:
-        lstm_pred = None  # LSTM fallback
-
-    try:
-        xgb_pred_scaled = xgb_model.predict(scaled_features[-1].reshape(1, -1))
-        xgb_pred = scaler_y.inverse_transform(xgb_pred_scaled.reshape(-1, 1))[0, 0]
-    except:
-        xgb_pred = None  # XGBoost fallback
+    stock_symbol = request.args.get('symbol', 'ITC.NS')  # Default to ITC.NS if no symbol provided
+    # Run your prediction logic here
+    predicted_price = 412.03  # Replace with your actual model's prediction
 
     return jsonify({
-        "symbol": symbol,
-        "last_close": df["Close"].iloc[-1],
-        "lstm_pred": lstm_pred,
-        "xgb_pred": xgb_pred,
-        "rsi": df["RSI"].iloc[-1],
-        "macd": df["MACD"].iloc[-1],
-        "sma_50": df["SMA_50"].iloc[-1],
-        "ema_50": df["EMA_50"].iloc[-1],
-        "sentiment": df["Sentiment"].iloc[-1],
+        "stock": stock_symbol,
+        "predicted_price": predicted_price
     })
 
-# ✅ Health check
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"message": "Stock Prediction API is running!"})
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(debug=True, host="0.0.0.0", port=5000)
