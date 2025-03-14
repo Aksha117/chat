@@ -1,126 +1,133 @@
+import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import joblib
 import requests
+from flask import Flask, request, jsonify
 from bs4 import BeautifulSoup
 from textblob import TextBlob
-import joblib
-import os
 import tensorflow as tf
-from flask import Flask, request, jsonify
 from tensorflow.keras.models import load_model
-from xgboost import XGBRegressor
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
+import xgboost as xgb
 
 app = Flask(__name__)
 
-# ✅ Compute Technical Indicators
+# ✅ Function to compute technical indicators
 def compute_indicators(df):
     df['SMA_50'] = df['Close'].rolling(50).mean()
     df['EMA_50'] = df['Close'].ewm(span=50).mean()
     delta = df['Close'].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = -delta.clip(upper=0).rolling(14).mean()
-    df['RSI'] = 100 - (100 / (1 + gain / loss))
+    df['RSI'] = 100 - (100 / (1 + gain/loss))
     df['MACD'] = df['Close'].ewm(span=12).mean() - df['Close'].ewm(span=26).mean()
     df['Signal'] = df['MACD'].ewm(span=9).mean()
-    return df.ffill().bfill()
+    df.fillna(method="bfill", inplace=True)
+    return df
 
-# ✅ Fetch News Sentiment
+# ✅ Fetch real-time sentiment score
 def fetch_sentiment(symbol):
     try:
         url = f"https://www.bing.com/news/search?q={symbol}+stock"
-        soup = BeautifulSoup(requests.get(url, headers={'User-Agent': 'Mozilla'}).text, 'html.parser')
+        soup = BeautifulSoup(requests.get(url, headers={'User-Agent':'Mozilla'}).text, 'html.parser')
         headlines = [h.text for h in soup.find_all("a") if h.text.strip()]
         return np.mean([TextBlob(h).sentiment.polarity for h in headlines]) if headlines else 0
-    except:
-        return 0  # Neutral if sentiment can't be fetched
+    except Exception as e:
+        print(f"Sentiment fetch error: {e}")
+        return 0  # Default sentiment score
 
-# ✅ Load or Train XGBoost Model
-def get_or_train_xgboost(symbol, df, features):
-    xgb_path = f"models/{symbol}_xgb.pkl"
-
-    # If XGBoost model exists, load it
-    if os.path.exists(xgb_path):
-        return joblib.load(xgb_path)
-
-    print(f"⚠️ XGBoost model not found for {symbol}. Training now...")
-
-    # Prepare training data
-    df['Sentiment'] = fetch_sentiment(symbol)
-    scaler_X, scaler_y = MinMaxScaler(), MinMaxScaler()
-    scaled_features = scaler_X.fit_transform(df[features])
-    scaled_target = scaler_y.fit_transform(df[['Close']])
-
-    X_train, X_test, y_train, y_test = train_test_split(scaled_features, scaled_target, test_size=0.2, shuffle=False)
-
-    # Train XGBoost model
-    model_xgb = XGBRegressor(n_estimators=200, learning_rate=0.05, max_depth=6, random_state=42)
-    model_xgb.fit(X_train, y_train.ravel())
-
-    # Save model & scalers
-    joblib.dump(model_xgb, xgb_path)
-    joblib.dump(scaler_X, f"models/{symbol}_scaler_X.pkl")
-    joblib.dump(scaler_y, f"models/{symbol}_scaler_y.pkl")
-
-    print(f"✅ XGBoost Model trained and saved for {symbol}")
-    return model_xgb
-
-# ✅ Load LSTM Model
-def load_lstm_model(symbol):
-    model_path = f"models/{symbol}_lstm.h5"
-    return load_model(model_path, compile=False) if os.path.exists(model_path) else None
-
-# ✅ Predict Stock Price
-def predict_stock(symbol):
-    print(f"📈 Fetching data for {symbol}...")
-    df = yf.download(symbol, period="70d")[['Close', 'Volume']]
-    
+# ✅ Fetch stock data from Yahoo Finance
+def fetch_stock_data(symbol):
+    df = yf.download(symbol, period='70d')
     if df.empty:
-        return {"error": f"No data found for {symbol}"}
+        raise ValueError("Stock data not available.")
 
     df = compute_indicators(df)
     df['Sentiment'] = fetch_sentiment(symbol)
 
-    features = ['Close', 'Volume', 'SMA_50', 'EMA_50', 'RSI', 'MACD', 'Signal', 'Sentiment']
+    return df
 
-    # Load LSTM & XGBoost
-    model_lstm = load_lstm_model(symbol)
-    model_xgb = get_or_train_xgboost(symbol, df, features)
+# ✅ Train XGBoost model if missing
+def train_xgboost(symbol, df):
+    print(f"⚙️ Training XGBoost model for {symbol}...")
+    features = ['Close', 'SMA_50', 'EMA_50', 'RSI', 'MACD', 'Signal', 'Sentiment']
+    df = df[features].dropna()
 
-    scaler_X = joblib.load(f"models/{symbol}_scaler_X.pkl")
-    scaler_y = joblib.load(f"models/{symbol}_scaler_y.pkl")
+    X, y = df.iloc[:-1], df.iloc[1:]['Close']
+    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=200)
+    model.fit(X, y)
 
-    # Scale features
-    scaled_features = scaler_X.transform(df[features])
-    sequence = scaled_features[-60:].reshape(1, 60, len(features))
+    joblib.dump(model, f"models/{symbol}_xgb.pkl")
+    print(f"✅ XGBoost model trained for {symbol}.")
 
-    # Use LSTM if available, else fallback to XGBoost
-    if model_lstm:
-        lstm_pred_scaled = model_lstm.predict(sequence)
-        predicted_price = scaler_y.inverse_transform(lstm_pred_scaled.reshape(-1, 1))[0, 0]
-        model_used = "LSTM"
-    else:
-        predicted_price = scaler_y.inverse_transform(model_xgb.predict(scaled_features[-1].reshape(1, -1)).reshape(-1, 1))[0, 0]
-        model_used = "XGBoost"
-
-    return {
-        "symbol": symbol,
-        "predicted_price": round(predicted_price, 2),
-        "model_used": model_used
-    }
-
-# ✅ API Route
+# ✅ Prediction API
 @app.route("/predict", methods=["GET"])
 def predict():
-    symbol = request.args.get("symbol", "").upper()
+    symbol = request.args.get("symbol", "").upper().strip()
     if not symbol:
-        return jsonify({"error": "Stock symbol is required!"})
+        return jsonify({"error": "Stock symbol is required."})
 
-    prediction = predict_stock(symbol)
-    return jsonify(prediction)
+    try:
+        df = fetch_stock_data(symbol)
+        features = ['Close', 'SMA_50', 'EMA_50', 'RSI', 'MACD', 'Signal', 'Sentiment']
+        df = df[features].dropna()
+
+        model_path_lstm = f"models/{symbol}_lstm.h5"
+        model_path_xgb = f"models/{symbol}_xgb.pkl"
+
+        if os.path.exists(model_path_lstm):
+            print(f"🔮 Using LSTM model for {symbol}...")
+            lstm_model = load_model(model_path_lstm, compile=False)
+
+            # ✅ Properly fit scalers before transforming data
+            scaler_X = MinMaxScaler()
+            scaler_y = MinMaxScaler()
+            
+            scaler_X.fit(df)
+            scaler_y.fit(df[['Close']])
+
+            scaled_features = scaler_X.transform(df)
+            sequence = scaled_features[-60:].reshape(1, 60, len(features))
+
+            lstm_pred_scaled = lstm_model.predict(sequence)
+            lstm_pred = scaler_y.inverse_transform(lstm_pred_scaled.reshape(-1, 1))[0, 0]
+            predicted_price = float(lstm_pred)  # Convert to Python float
+            model_used = "LSTM Model"
+
+        elif os.path.exists(model_path_xgb):
+            print(f"⚠️ LSTM not found. Using XGBoost...")
+            xgb_model = joblib.load(model_path_xgb)
+            predicted_price = float(xgb_model.predict(df.iloc[-1:].values.reshape(1, -1))[0])  # Convert to Python float
+            model_used = "XGBoost Model"
+
+        else:
+            print(f"⚠️ No trained models found. Training XGBoost on the spot...")
+            train_xgboost(symbol, df)
+            xgb_model = joblib.load(model_path_xgb)
+            predicted_price = float(xgb_model.predict(df.iloc[-1:].values.reshape(1, -1))[0])  # Convert to Python float
+            model_used = "Newly Trained XGBoost Model"
+
+        return jsonify({
+            "symbol": symbol,
+            "current_price": float(df['Close'].iloc[-1]),  # Convert to Python float
+            "predicted_price": round(predicted_price, 2),
+            "model_used": model_used,
+            "technical_indicators": {
+                "SMA_50": round(float(df['SMA_50'].iloc[-1]), 2),
+                "EMA_50": round(float(df['EMA_50'].iloc[-1]), 2),
+                "RSI": round(float(df['RSI'].iloc[-1]), 2),
+                "MACD": round(float(df['MACD'].iloc[-1]), 2),
+                "Signal": round(float(df['Signal'].iloc[-1]), 2),
+                "Sentiment": round(float(df['Sentiment'].iloc[-1]), 4),
+            }
+        })
+
+    except Exception as e:
+        print(f"❌ Error in prediction: {e}")
+        return jsonify({"error": "Prediction failed. Try again later."})
 
 # ✅ Run Flask App
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(debug=True, host="0.0.0.0", port=5000)
